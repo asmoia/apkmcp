@@ -195,16 +195,21 @@ class AgentAccessibilityService : AccessibilityService() {
 
     fun focusedEditable(): AccessibilityNodeInfo? {
         val root = rootNode() ?: return null
-        root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let { return it }
-        return firstEditable(root, 0)
-    }
-
-    private fun firstEditable(n: AccessibilityNodeInfo, depth: Int): AccessibilityNodeInfo? {
-        if (depth > 30) return null
-        if (n.isEditable && n.isVisibleToUser) return n
-        for (i in 0 until n.childCount) {
-            val c = n.getChild(i) ?: continue
-            firstEditable(c, depth + 1)?.let { return it }
+        root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let {
+            if (it.isEditable) return it
+        }
+        // WebView 虚拟树可能很深（ChatGPT 的 contenteditable 深度>30）：
+        // 与 findNode 一致的 BFS，无深度限制，只受节点预算约束
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 4000) {
+            val n = queue.removeFirst()
+            visited++
+            if (n.isEditable && n.isVisibleToUser) return n
+            for (i in 0 until n.childCount) {
+                n.getChild(i)?.let { queue.add(it) }
+            }
         }
         return null
     }
