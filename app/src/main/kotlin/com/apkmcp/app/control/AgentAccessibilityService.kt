@@ -237,10 +237,10 @@ class AgentAccessibilityService : AccessibilityService() {
             for (w in windows) {
                 if (w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
                     open = true
-                    imePkg = w.packageName?.toString()
+                    imePkg = w.root?.packageName?.toString()
                 }
                 if (w.isActive && w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION) {
-                    activePkg = w.packageName?.toString()
+                    activePkg = w.root?.packageName?.toString()
                 }
             }
             Triple(open, imePkg, activePkg)
