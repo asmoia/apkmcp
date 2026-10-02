@@ -8,6 +8,7 @@ import android.util.Base64
 import com.apkmcp.app.ApkMcpApp
 import com.apkmcp.app.capture.ScreenCaptureService
 import com.apkmcp.app.control.AgentAccessibilityService
+import com.apkmcp.app.control.EventBus
 import com.apkmcp.app.core.Logs
 import com.apkmcp.app.core.Prefs
 import com.apkmcp.app.enhance.ShizukuEnhance
@@ -24,6 +25,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -175,6 +177,65 @@ object ToolRegistry {
             "get_status",
             "查看当前各权限/服务是否就绪。",
             noArgs()
+        ),
+        // ── 事件层（大脑信号）──────────────────────────────
+        ToolDef(
+            "events",
+            "读取最近的无障碍事件流（系统原生信号，不用截图）。光标位置、文字增删、窗口切换、" +
+                "键盘开关、点击、滚动都在里面，每行一条，省 token。配合 wait_event 用。",
+            obj(
+                """{"type":"object","properties":{"since_ms":{"type":"integer","description":"只要这个墙钟毫秒之后的事件（用上次结果的 tMs）"},"type_contains":{"type":"string","description":"按类型过滤，如 SELECTION / WINDOW_STATE"},"package":{"type":"string"},"limit":{"type":"integer","description":"默认 40，最大 200"}}}"""
+            )
+        ),
+        ToolDef(
+            "wait_event",
+            "在手机上阻塞等待一个事件出现（服务端等待，比反复截图/读树快得多也省得多）。" +
+                "如：等窗口切换(WINDOW_STATE_CHANGED)、等文字出现(VIEW_TEXT_CHANGED)、等键盘开关(WINDOWS_CHANGED)、" +
+                "等光标移动(VIEW_TEXT_SELECTION_CHANGED)。settle_ms>0 时：先等匹配，再等界面安静。",
+            obj(
+                """{"type":"object","properties":{"type_contains":{"type":"string"},"text_contains":{"type":"string"},"package":{"type":"string"},"timeout_ms":{"type":"integer","description":"默认 8000，最大 120000"},"settle_ms":{"type":"integer","description":"匹配后再等界面安静这么久（如 400），0=不等"},"since_ms":{"type":"integer","description":"只考虑此时刻之后的事件，默认现在"}},"required":["type_contains"]}"""
+            )
+        ),
+        ToolDef(
+            "set_cursor",
+            "把光标移到输入框文本的第 N 个字符（字符偏移，不是像素！）。会从事件流验证光标真的到位。找输入框可用 find 参数，不传=当前聚焦的输入框。",
+            obj(
+                """{"type":"object","properties":{"offset":{"type":"integer"},"find":{"type":"string","description":"按文字/提示找输入框，如 Message"},"exact":{"type":"boolean"}},"required":["offset"]}"""
+            )
+        ),
+        ToolDef(
+            "select_text",
+            "选中输入框文本中 [start,end) 的精确范围（字符偏移）。之后可用 press_key 或 App 的替换功能改字。",
+            obj(
+                """{"type":"object","properties":{"start":{"type":"integer"},"end":{"type":"integer"},"find":{"type":"string"},"exact":{"type":"boolean"}},"required":["start","end"]}"""
+            )
+        ),
+        ToolDef(
+            "keyboard_state",
+            "软键盘现在开没开？输入法是谁？前台窗口是哪个包？（都是系统级事实，不用截图猜）",
+            noArgs()
+        ),
+        ToolDef(
+            "screen_mode",
+            "我现在在哪个界面？= 当前窗口包名/Activity + 最近的窗口切换历史 + 键盘状态 + 用户空闲多久。" +
+                "搞不清自己在哪时先调这个。",
+            noArgs()
+        ),
+        ToolDef(
+            "paste_text",
+            "真输入法路线写入文字：剪贴板 + 光标定位 + ACTION_PASTE（比 type_text 更接近真人输入，" +
+                "type_text 写进去了但对方 App 不认/发不出去时用它）。append=false 时先清空。",
+            obj(
+                """{"type":"object","properties":{"text":{"type":"string"},"append":{"type":"boolean","description":"默认 true=追加到末尾"}},"required":["text"]}"""
+            )
+        ),
+        ToolDef(
+            "click_node",
+            "节点级点击：按文字找到控件后直接 performAction(ACTION_CLICK)，不派发手势。" +
+                "和 find_and_tap（手势点击）是两条不同的路；手势点击失灵、或元素被键盘/边缘遮挡时用它。",
+            obj(
+                """{"type":"object","properties":{"text":{"type":"string"},"exact":{"type":"boolean"}},"required":["text"]}"""
+            )
         )
     )
 
@@ -189,6 +250,8 @@ object ToolRegistry {
     fun call(name: String, args: JsonObject?): ToolResult {
         val a = args ?: JsonObject(emptyMap())
         return try {
+            // wait_event 在锁外执行：等待期间不许挡住其它工具（事件总线自己线程安全）
+            if (name == "wait_event") return waitEvent(a)
             synchronized(lock) {
                 dispatch(name, a)
             }
@@ -215,6 +278,13 @@ object ToolRegistry {
         "wait" -> waitTool(a)
         "screen_size" -> screenSize()
         "get_status" -> status()
+        "events" -> events(a)
+        "set_cursor" -> setCursor(a)
+        "select_text" -> selectText(a)
+        "keyboard_state" -> keyboardState()
+        "screen_mode" -> screenMode()
+        "paste_text" -> pasteText(a)
+        "click_node" -> clickNode(a)
         else -> ToolResult.error("未知工具: $name")
     }
 
@@ -562,6 +632,146 @@ object ToolRegistry {
         sb.append("监听: ").append(if (cfg.bindAll) "0.0.0.0（局域网可访问）" else "127.0.0.1（仅本机）").append('\n')
         sb.append("截图最长边: ").append(cfg.maxWidth).append("，质量 ").append(cfg.jpegQuality)
         return ToolResult.text(sb.toString())
+    }
+
+    // ── 事件层工具实现 ──────────────────────────────────────
+
+    private fun events(a: JsonObject): ToolResult {
+        val since = a["since_ms"]?.jsonPrimitive?.longOrNull
+        val typeC = a["type_contains"]?.jsonPrimitive?.contentOrNull
+        val pkgC = a["package"]?.jsonPrimitive?.contentOrNull
+        val limit = a["limit"]?.jsonPrimitive?.intOrNull ?: 40
+        val list = EventBus.snapshot(since, typeC, pkgC, limit)
+        val head = "事件（新→旧，共 ${list.size} 条；tMs=墙钟毫秒） ${EventBus.stats()}\n"
+        val body = list.joinToString("\n") { it.line() }
+        return ToolResult.text(head + body.ifEmpty { "（无匹配事件）" })
+    }
+
+    private fun waitEvent(a: JsonObject): ToolResult {
+        val typeC = a["type_contains"]?.jsonPrimitive?.contentOrNull
+            ?: return ToolResult.error("需要 type_contains（如 WINDOW_STATE_CHANGED）")
+        val textC = a["text_contains"]?.jsonPrimitive?.contentOrNull
+        val pkgC = a["package"]?.jsonPrimitive?.contentOrNull
+        val timeout = (a["timeout_ms"]?.jsonPrimitive?.longOrNull ?: 8000L).coerceIn(100L, 120000L)
+        val settle = a["settle_ms"]?.jsonPrimitive?.longOrNull ?: 0L
+        val sinceWall = a["since_ms"]?.jsonPrimitive?.longOrNull
+        val sinceMono = if (sinceWall != null) sinceWall - (System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime())
+        else EventBus.nowMono()
+
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        val hit = EventBus.waitFor(sinceMono, timeout) { ev ->
+            ev.type.contains(typeC, true) &&
+                (textC == null || (ev.text ?: "").contains(textC, true)) &&
+                (pkgC == null || (ev.pkg ?: "").contains(pkgC, true))
+        }
+        if (hit == null) {
+            val tail = EventBus.snapshot(null, typeC, pkgC, 5)
+            return ToolResult.text(
+                "TIMEOUT ${android.os.SystemClock.elapsedRealtime() - t0}ms 未等到 ${typeC}。" +
+                    if (tail.isNotEmpty()) "最近的同类事件:\n" + tail.joinToString("\n") { it.line() } else "（事件流里没有同类事件）"
+            )
+        }
+        var settled = true
+        if (settle > 0) {
+            settled = EventBus.waitQuiet(hit.monoMs, settle, timeout)
+        }
+        val after = EventBus.snapshot(hit.tMs - 1, null, null, 15)
+            .filter { it.monoMs >= hit.monoMs }
+        val head = buildString {
+            append("命中 ").append(hit.line())
+            append("\n耗时 ").append(android.os.SystemClock.elapsedRealtime() - t0).append("ms")
+            if (settle > 0) append("，界面").append(if (settled) "已安静 ${settle}ms" else "未完全安静")
+            append("\n── 其后事件 ──")
+        }
+        val body = after.drop(1).joinToString("\n") { it.line() }
+        return ToolResult.text(head + "\n" + body.ifEmpty { "（无）" })
+    }
+
+    private fun setCursor(a: JsonObject): ToolResult {
+        val svc = AgentAccessibilityService.instance
+            ?: return ToolResult.error("无障碍服务没开。")
+        val offset = a["offset"]?.jsonPrimitive?.intOrNull
+            ?: return ToolResult.error("需要 offset（字符偏移）")
+        val find = a["find"]?.jsonPrimitive?.contentOrNull
+        val exact = a["exact"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+        val (ok, echoed, len) = svc.setSelection(offset, offset, find, exact)
+        return when {
+            !ok -> ToolResult.error("设置光标失败：找不到输入框或控件不支持。")
+            echoed -> ToolResult.text("光标已到第 $offset 字符（事件回显验证 ✓，输入框长度 $len）")
+            else -> ToolResult.text("已请求光标到第 $offset 字符（框长 $len），但事件流 900ms 内未见回显 —— 可能控件不报选区，用 events 查。")
+        }
+    }
+
+    private fun selectText(a: JsonObject): ToolResult {
+        val svc = AgentAccessibilityService.instance
+            ?: return ToolResult.error("无障碍服务没开。")
+        val start = a["start"]?.jsonPrimitive?.intOrNull ?: return ToolResult.error("需要 start")
+        val end = a["end"]?.jsonPrimitive?.intOrNull ?: return ToolResult.error("需要 end")
+        val find = a["find"]?.jsonPrimitive?.contentOrNull
+        val exact = a["exact"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+        val (ok, echoed, len) = svc.setSelection(start, end, find, exact)
+        return when {
+            !ok -> ToolResult.error("选中失败：找不到输入框或控件不支持。")
+            echoed -> ToolResult.text("已选中 [$start,$end)（事件回显验证 ✓，框长 $len）")
+            else -> ToolResult.text("已请求选中 [$start,$end)（框长 $len），未见事件回显，用 events 查。")
+        }
+    }
+
+    private fun keyboardState(): ToolResult {
+        val svc = AgentAccessibilityService.instance
+            ?: return ToolResult.error("无障碍服务没开。")
+        val (open, ime, active) = svc.keyboardState()
+        return ToolResult.text(
+            "键盘: " + (if (open) "开" else "关") +
+                " | 输入法: " + (ime ?: "?") +
+                " | 前台应用: " + (active ?: "?")
+        )
+    }
+
+    private fun screenMode(): ToolResult {
+        val svc = AgentAccessibilityService.instance
+            ?: return ToolResult.error("无障碍服务没开。")
+        val (open, ime, active) = svc.keyboardState()
+        val win = EventBus.lastWindowState
+        val hist = EventBus.snapshot(null, "WINDOW_STATE_CHANGED", null, 5)
+        val idle = EventBus.userIdleMs()
+        return ToolResult.text(
+            buildString {
+                append("前台: ").append(active ?: svc.currentPackage() ?: "?")
+                append(" | 键盘").append(if (open) "开" else "关")
+                if (ime != null) append("(").append(ime).append(")")
+                append(" | 用户空闲: ").append(if (idle < 0) "未知" else "${idle / 1000}s")
+                append("\n最近窗口切换:")
+                append(if (hist.isEmpty()) "（暂无记录）" else "\n" + hist.joinToString("\n") { it.line() })
+                if (win != null) append("\n最近 WINDOW_STATE_CHANGED: ").append(win.line())
+            }
+        )
+    }
+
+    private fun pasteText(a: JsonObject): ToolResult {
+        val svc = AgentAccessibilityService.instance
+            ?: return ToolResult.error("无障碍服务没开。")
+        val text = a["text"]?.jsonPrimitive?.contentOrNull
+            ?: return ToolResult.error("需要 text")
+        val append = a["append"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: true
+        val ok = svc.pasteText(text, append)
+        return if (ok) ToolResult.text("已粘贴（${text.length} 字，${if (append) "追加" else "替换"}）。可用 events 查 VIEW_TEXT_CHANGED 验证。")
+        else ToolResult.error("粘贴失败：没有聚焦的输入框，先 tap 一下输入框。")
+    }
+
+    private fun clickNode(a: JsonObject): ToolResult {
+        val svc = AgentAccessibilityService.instance
+            ?: return ToolResult.error("无障碍服务没开。")
+        val needle = a["text"]?.jsonPrimitive?.contentOrNull
+            ?: return ToolResult.error("需要 text")
+        val exact = a["exact"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+        val node = svc.findNode(needle, exact)
+            ?: return ToolResult.error("界面上没找到「$needle」。")
+        val r = android.graphics.Rect()
+        node.getBoundsInScreen(r)
+        val ok = svc.nodeClick(needle, exact)
+        return if (ok) ToolResult.text("已节点级点击「$needle」 bounds=[${r.left},${r.top},${r.right},${r.bottom}]（非手势路径）")
+        else ToolResult.error("找到「$needle」但 ACTION_CLICK 被拒绝，试 find_and_tap。")
     }
 
     // ── 坐标换算 ────────────────────────────────────────────

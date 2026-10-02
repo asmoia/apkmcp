@@ -26,7 +26,10 @@ class AgentAccessibilityService : AccessibilityService() {
         Logs.add("无障碍服务已连接")
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    /** 系统的「大脑信号」全部进入事件总线（此前被直接丢弃） */
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        event?.let { EventBus.push(this, it) }
+    }
 
     override fun onInterrupt() = Unit
 
@@ -96,6 +99,7 @@ class AgentAccessibilityService : AccessibilityService() {
      * 退化为只返回「已受理」。当前所有调用方都在 HTTP 工作线程，不走这条分支。
      */
     private fun dispatch(path: Path, start: Long, duration: Long): Boolean {
+        EventBus.markAgent(1000L + duration)   // 由此产生的系统事件会被打上 [agent] 标记
         var completed = false
         val done = CountDownLatch(1)
         val onMain = Looper.getMainLooper() === Looper.myLooper()
@@ -207,6 +211,7 @@ class AgentAccessibilityService : AccessibilityService() {
 
     fun typeText(text: String, replace: Boolean = true): Boolean {
         val target = focusedEditable() ?: return false
+        EventBus.markAgent(1500L)
         return try {
             val args = Bundle().apply {
                 putCharSequence(
@@ -217,6 +222,95 @@ class AgentAccessibilityService : AccessibilityService() {
             target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
         } catch (t: Throwable) {
             Logs.add("输入失败: ${t.message}")
+            false
+        }
+    }
+
+    // ── 事件层新能力：光标 / 选区 / 粘贴 / 节点点击 ─────────
+
+    /** 键盘是否打开（TYPE_INPUT_METHOD 窗口存在即开） */
+    fun keyboardState(): Triple<Boolean, String?, String?> {
+        return try {
+            var open = false
+            var imePkg: String? = null
+            var activePkg: String? = null
+            for (w in windows) {
+                if (w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                    open = true
+                    imePkg = w.packageName?.toString()
+                }
+                if (w.isActive && w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION) {
+                    activePkg = w.packageName?.toString()
+                }
+            }
+            Triple(open, imePkg, activePkg)
+        } catch (t: Throwable) {
+            Triple(false, null, null)
+        }
+    }
+
+    /**
+     * 移动光标 / 选中文本（字符偏移，非像素！）。start==end 即光标。
+     * @param find 可选：按文字找目标输入框；不传则用当前聚焦的输入框
+     * @return 三元组：成功、事件回显验证、目标框当前文字长度（-1=未知）
+     */
+    fun setSelection(start: Int, end: Int, find: String? = null, exact: Boolean = false): Triple<Boolean, Boolean, Int> {
+        val target = (find?.let { findNode(it, exact) } ?: focusedEditable())
+            ?: return Triple(false, false, -1)
+        EventBus.markAgent(1200L)
+        val len = target.text?.length ?: -1
+        val args = Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, start)
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, end)
+        }
+        val ok = try {
+            target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, args)
+        } catch (t: Throwable) {
+            false
+        }
+        // 从事件流里验证系统真的把光标放上去了（人类「看见光标闪」的机器版）
+        val echoed = EventBus.waitFor(
+            EventBus.nowMono() - 500L, 900L
+        ) {
+            it.type == "VIEW_TEXT_SELECTION_CHANGED" && it.selStart == start && it.selEnd == end
+        } != null
+        return Triple(ok, echoed, len)
+    }
+
+    /**
+     * 走「真输入法路线」：写入剪贴板 → 光标定位 → ACTION_PASTE。
+     * 比 ACTION_SET_TEXT 更接近人手输入，部分 App（如 Telegram）只认这条路。
+     * @param append true=追加到末尾，false=全量替换
+     */
+    fun pasteText(text: String, append: Boolean): Boolean {
+        val target = focusedEditable() ?: return false
+        EventBus.markAgent(2000L)
+        return try {
+            val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("apkmcp", text))
+            if (append) {
+                val cur = target.text?.toString() ?: ""
+                val argsEnd = Bundle().apply {
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, cur.length)
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, cur.length)
+                }
+                target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, argsEnd)
+                Thread.sleep(120)
+            }
+            target.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        } catch (t: Throwable) {
+            Logs.add("粘贴失败: ${t.message}")
+            false
+        }
+    }
+
+    /** 节点级点击（performAction），与手势点击是两条不同的路，手势失灵时用它 */
+    fun nodeClick(find: String, exact: Boolean = false): Boolean {
+        val node = findNode(find, exact) ?: return false
+        EventBus.markAgent(1200L)
+        return try {
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        } catch (t: Throwable) {
             false
         }
     }
