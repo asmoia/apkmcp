@@ -655,8 +655,10 @@ object ToolRegistry {
         val timeout = (a["timeout_ms"]?.jsonPrimitive?.longOrNull ?: 8000L).coerceIn(100L, 120000L)
         val settle = a["settle_ms"]?.jsonPrimitive?.longOrNull ?: 0L
         val sinceWall = a["since_ms"]?.jsonPrimitive?.longOrNull
-        val sinceMono = if (sinceWall != null) sinceWall - (System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime())
+        // 客户端时钟可能与手机不同步：since 最多追溯到「现在-2.5s」，防止把刚发生的事件过滤掉
+        val rawSince = if (sinceWall != null) sinceWall - (System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime())
         else EventBus.nowMono()
+        val sinceMono = minOf(rawSince, EventBus.nowMono() - 2500L)
 
         val t0 = android.os.SystemClock.elapsedRealtime()
         val hit = EventBus.waitFor(sinceMono, timeout) { ev ->
