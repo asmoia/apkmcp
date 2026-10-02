@@ -10,5 +10,5 @@ captures/
 local.properties
 app/build/
 *.apk
-*.keystore
+# *.keystore  # 固定签名需要提交（仅 debug 用）
 *.idsig
