@@ -25,6 +25,15 @@ android {
                 "proguard-rules.pro"
             )
         }
+        debug {
+            // 固定签名：CI 每次构建都能覆盖安装（否则 runner 的临时 debug.keystore 每次都变）
+            signingConfig = signingConfigs.getByName("debug").apply {
+                storeFile = file("debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
     }
 
     compileOptions {
